@@ -1,7 +1,12 @@
 // src/components/conference/AllParticipants.jsx
 import React, { useState } from "react";
 
-const AllParticipants = ({ allTimeParticipants, onRedial, userRole }) => {
+const AllParticipants = ({
+  allTimeParticipants = {},
+  onRedial,
+  userRole,
+  onRefresh,
+}) => {
   const [showActiveOnly, setShowActiveOnly] = useState(false);
 
   const formatTime = (timestamp) => {
@@ -11,6 +16,7 @@ const AllParticipants = ({ allTimeParticipants, onRedial, userRole }) => {
   };
 
   const calculateDuration = (joinTime, disconnectTime) => {
+    if (!joinTime) return "";
     const start = new Date(joinTime);
     const end = disconnectTime ? new Date(disconnectTime) : new Date();
     const duration = Math.floor((end - start) / 1000);
@@ -19,7 +25,7 @@ const AllParticipants = ({ allTimeParticipants, onRedial, userRole }) => {
     return `${minutes}m ${seconds}s`;
   };
 
-  // Filter out any entries without display_name
+  // Convert map -> array. Expect keys to be UUIDs.
   const participantsList = Object.values(allTimeParticipants).filter(
     (p) => p && p.display_name
   );
@@ -42,21 +48,34 @@ const AllParticipants = ({ allTimeParticipants, onRedial, userRole }) => {
             Active: {activeCount} | Disconnected: {totalCount - activeCount}
           </p>
         </div>
-        <button
-          onClick={() => setShowActiveOnly(!showActiveOnly)}
-          className="rounded-md bg-gray-3 dark:bg-form-input px-3 py-1.5 text-sm hover:bg-opacity-90"
-        >
-          {showActiveOnly ? "Show All" : "Active Only"}
-        </button>
+
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowActiveOnly(!showActiveOnly)}
+            className="rounded-md bg-gray-3 dark:bg-form-input px-3 py-1.5 text-sm hover:bg-opacity-90"
+          >
+            {showActiveOnly ? "Show All" : "Active Only"}
+          </button>
+
+          {/* Refresh button uses onRefresh prop (App.jsx should pass fetchParticipantsSnapshot) */}
+          {typeof onRefresh === "function" && (
+            <button
+              onClick={onRefresh}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-opacity-90"
+            >
+              Refresh
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="space-y-3 max-h-96 overflow-y-auto">
         {filteredList.length === 0 ? (
           <p className="text-bodydark2">No participants to display</p>
         ) : (
-          filteredList.map((participant, index) => (
+          filteredList.map((participant) => (
             <div
-              key={`${participant.display_name}-${index}`}
+              key={participant.uuid} // use stable uuid as key
               className="flex items-center justify-between p-3 rounded-lg bg-gray-2 dark:bg-form-strokedark"
             >
               <div className="flex-1">
@@ -94,11 +113,12 @@ const AllParticipants = ({ allTimeParticipants, onRedial, userRole }) => {
                 </div>
               </div>
 
+              {/* Redial: only show for disconnected participants that have a uri and current user is chair */}
               {!participant.isActive &&
                 userRole === "chair" &&
                 participant.uri && (
                   <button
-                    onClick={() => onRedial(participant)}
+                    onClick={() => onRedial && onRedial(participant)}
                     className="rounded bg-primary px-4 py-2 text-sm font-medium text-gray hover:bg-opacity-90"
                   >
                     Redial

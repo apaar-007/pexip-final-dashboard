@@ -95,45 +95,78 @@ function App() {
       const message = JSON.parse(event.data);
       setMessages((prev) => [...prev, message]);
     });
+    // === participant_create (replace existing handler) ===
     eventSource.addEventListener("participant_create", (event) => {
       const newParticipant = JSON.parse(event.data);
-      const participantKey = newParticipant.display_name;
 
-      if (!participantKey) return; // Skip if no display name
+      // early return if nothing useful
+      if (
+        !newParticipant ||
+        (!newParticipant.uuid && !newParticipant.display_name)
+      )
+        return;
 
-      const existingParticipant = allTimeParticipants[participantKey];
-      const isRejoin =
-        existingParticipant &&
-        existingParticipant.disconnectTime !== null &&
-        existingParticipant.isActive === false;
+      setAllTimeParticipants((prev) => {
+        // try to find existing entry by UUID (best) or by display_name
+        const existingKeyByUuid = Object.keys(prev).find(
+          (k) =>
+            prev[k].uuid &&
+            newParticipant.uuid &&
+            prev[k].uuid === newParticipant.uuid
+        );
+        const incomingName =
+          newParticipant.display_name || newParticipant.remote_display_name;
+        const key =
+          existingKeyByUuid ||
+          incomingName ||
+          `User_${newParticipant.uuid?.slice(0, 8)}`;
 
-      const shouldShowToast =
-        !existingParticipant || !existingParticipant.isActive;
+        const existing =
+          prev[key] ||
+          (existingKeyByUuid ? prev[existingKeyByUuid] : undefined);
 
-      if (shouldShowToast) {
-        if (isRejoin) {
-          showToast(`${participantKey} joined again`, "rejoin");
-        } else {
-          showToast(`${participantKey} joined the meeting`, "join");
-        }
-      }
+        const isRejoin = !!(
+          existing &&
+          existing.disconnectTime &&
+          existing.isActive === false
+        );
+        const shouldShowToast = !existing || !existing.isActive;
 
-      setAllTimeParticipants((prev) => ({
-        ...prev,
-        [participantKey]: {
+        const merged = {
+          ...(existing || {}),
           ...newParticipant,
-          display_name: participantKey,
-          joinTime: existingParticipant?.joinTime || new Date().toISOString(),
+          display_name:
+            existing?.display_name ||
+            incomingName ||
+            `User_${newParticipant.uuid?.slice(0, 8)}`,
+          uuid: newParticipant.uuid,
+          protocol: newParticipant.protocol || existing?.protocol || "sip",
+          uri:
+            newParticipant.uri ||
+            newParticipant.local_alias ||
+            existing?.uri ||
+            null,
+          joinTime: existing?.joinTime || new Date().toISOString(),
           disconnectTime: null,
           isActive: true,
-          protocol: newParticipant.protocol || "sip",
-          uri: newParticipant.uri || newParticipant.local_alias || null,
-          uuid: newParticipant.uuid,
-          rejoinCount:
-            (existingParticipant?.rejoinCount || 0) + (isRejoin ? 1 : 0),
-        },
-      }));
+          rejoinCount: (existing?.rejoinCount || 0) + (isRejoin ? 1 : 0),
+        };
 
+        // show toast using resolved display_name
+        if (shouldShowToast) {
+          if (isRejoin)
+            showToast(`${merged.display_name} joined again`, "rejoin");
+          else showToast(`${merged.display_name} joined the meeting`, "join");
+        }
+
+        return {
+          ...prev,
+          // keep the key stable as the resolved display_name (so deletes find it)
+          [merged.display_name]: merged,
+        };
+      });
+
+      // keep the active participants list consistent
       setParticipants((prev) => {
         if (prev.some((p) => p.uuid === newParticipant.uuid)) return prev;
         return [...prev, newParticipant].sort((a, b) =>
@@ -141,21 +174,39 @@ function App() {
         );
       });
     });
+
+    // === participant_update (replace existing handler) ===
     eventSource.addEventListener("participant_update", (event) => {
       const updatedParticipant = JSON.parse(event.data);
-      const participantKey = updatedParticipant.display_name;
+      if (!updatedParticipant) return;
 
-      if (!participantKey) return; // Skip if no display name
+      setAllTimeParticipants((prev) => {
+        // Prefer matching by uuid; fallback to display_name
+        const matchKey =
+          Object.keys(prev).find(
+            (k) => prev[k].uuid && prev[k].uuid === updatedParticipant.uuid
+          ) ||
+          updatedParticipant.display_name ||
+          `User_${updatedParticipant.uuid?.slice(0, 8)}`;
 
-      setAllTimeParticipants((prev) => ({
-        ...prev,
-        [participantKey]: {
-          ...prev[participantKey],
+        const existing = prev[matchKey] || {};
+
+        const merged = {
+          ...existing,
           ...updatedParticipant,
-          display_name: participantKey,
+          display_name:
+            existing.display_name ||
+            updatedParticipant.display_name ||
+            `User_${updatedParticipant.uuid?.slice(0, 8)}`,
           uuid: updatedParticipant.uuid,
-        },
-      }));
+        };
+
+        // update key to the resolved display_name
+        return {
+          ...prev,
+          [merged.display_name]: merged,
+        };
+      });
 
       setParticipants((prev) =>
         prev.map((p) =>
@@ -163,52 +214,61 @@ function App() {
         )
       );
     });
+
+    // === participant_delete (replace existing handler) ===
     eventSource.addEventListener("participant_delete", (event) => {
       const deletedParticipant = JSON.parse(event.data);
+      if (!deletedParticipant) return;
 
-      // Find the participant's display_name from current participants list using UUID
-      const currentParticipant = participants.find(
-        (p) => p.uuid === deletedParticipant.uuid
-      );
-      const participantKey =
-        currentParticipant?.display_name || deletedParticipant.display_name;
-
-      // If we still don't have a name, check allTimeParticipants by UUID
-      let finalParticipantKey = participantKey;
-      if (!finalParticipantKey) {
-        const existingEntry = Object.values(allTimeParticipants).find(
-          (p) => p.uuid === deletedParticipant.uuid
+      // update allTimeParticipants in a functional manner so we always see latest state
+      setAllTimeParticipants((prev) => {
+        // find existing entry by uuid first
+        const existingKey = Object.keys(prev).find(
+          (k) =>
+            prev[k].uuid &&
+            deletedParticipant.uuid &&
+            prev[k].uuid === deletedParticipant.uuid
         );
-        finalParticipantKey = existingEntry?.display_name;
-      }
 
-      // Show toast only if we have a valid name
-      if (finalParticipantKey) {
-        showToast(`${finalParticipantKey} left the meeting`, "leave");
+        // determine the display name to show in the UI/toast:
+        const resolvedName =
+          (existingKey && prev[existingKey].display_name) ||
+          deletedParticipant.display_name ||
+          `User_${deletedParticipant.uuid?.slice(0, 8)}`;
 
-        // Update the participant's status
-        setAllTimeParticipants((prev) => {
-          // Don't create entry if participant wasn't tracked
-          if (!prev[finalParticipantKey]) return prev;
+        const existingEntry = existingKey ? prev[existingKey] : undefined;
 
-          return {
-            ...prev,
-            [finalParticipantKey]: {
-              ...prev[finalParticipantKey],
-              disconnectTime: new Date().toISOString(),
-              isActive: false,
-              disconnectReason:
-                deletedParticipant.disconnect_reason || "Left meeting",
-            },
-          };
-        });
-      }
+        const updated = {
+          ...(existingEntry || {
+            display_name: resolvedName,
+            uuid: deletedParticipant.uuid,
+            protocol: deletedParticipant.protocol || "sip",
+            uri: deletedParticipant.uri || null,
+            role: deletedParticipant.role || "guest",
+            joinTime: existingEntry?.joinTime || new Date().toISOString(),
+          }),
+          disconnectTime: new Date().toISOString(),
+          isActive: false,
+          disconnectReason:
+            deletedParticipant.disconnect_reason || "Left meeting",
+        };
 
-      // Remove from active participants
+        // show toast with the resolved name
+        showToast(`${resolvedName} left the meeting`, "leave");
+
+        // ensure the participant is updated under the resolved display_name key (not a new User_xxx unless truly missing)
+        return {
+          ...prev,
+          [updated.display_name]: updated,
+        };
+      });
+
+      // remove from "participants" (active) list
       setParticipants((prev) =>
         prev.filter((p) => p.uuid !== deletedParticipant.uuid)
       );
     });
+
     eventSource.addEventListener("presentation_start", () =>
       setIsReceivingPresentation(true)
     );
@@ -603,6 +663,77 @@ function App() {
     );
   };
 
+  // Fetch canonical snapshot of current participants and merge into allTimeParticipants keyed by uuid
+  async function fetchParticipantsSnapshot() {
+    try {
+      const res = await pexipApiGet(
+        `/conferences/${conferenceAlias}/participants`
+      );
+      const current = (res.result || []).map((p) => ({
+        uuid: p.uuid,
+        display_name:
+          p.display_name ||
+          p.remote_display_name ||
+          `User_${p.uuid?.slice(0, 8)}`,
+        uri: p.uri || p.local_alias || null,
+        protocol: p.protocol || "auto",
+        role: p.role || "guest",
+        raw: p,
+      }));
+
+      setAllTimeParticipants((prev) => {
+        const next = { ...prev };
+        const seen = new Set();
+
+        current.forEach((p) => {
+          seen.add(p.uuid);
+          next[p.uuid] = {
+            ...(prev[p.uuid] || {}),
+            ...p,
+            isActive: true,
+            disconnectTime: null,
+            joinTime: prev[p.uuid]?.joinTime || new Date().toISOString(),
+          };
+        });
+
+        // mark previously seen participants not in snapshot as disconnected
+        Object.keys(prev).forEach((k) => {
+          if (!seen.has(prev[k].uuid)) {
+            next[k] = {
+              ...(next[k] || prev[k]),
+              isActive: false,
+              disconnectTime:
+                next[k]?.disconnectTime || new Date().toISOString(),
+            };
+          }
+        });
+
+        return next;
+      });
+
+      // update the active participants array used by your UI
+      setParticipants(
+        current.sort((a, b) => a.display_name.localeCompare(b.display_name))
+      );
+    } catch (err) {
+      console.error("fetchParticipantsSnapshot error", err);
+    }
+  }
+
+  // Dial a participant (used by onRedial)
+  async function dialParticipant(participant) {
+    if (!participant) throw new Error("No participant to dial");
+    const destination =
+      participant.uri || participant.display_name || participant.uuid;
+    const body = {
+      destination,
+      protocol: "auto",
+      role: "guest",
+      remote_display_name: participant.display_name,
+    };
+    return pexipApiPost(`/conferences/${conferenceAlias}/dial`, body);
+  }
+
   // RESTORED HANDLERS
   const handleTransformLayout = (transformsData) => {
     const apiPath = `/api/client/v2/conferences/${conferenceAlias}/transform_layout`;
@@ -777,7 +908,12 @@ function App() {
           {/* All Participants Panel */}
           <AllParticipants
             allTimeParticipants={allTimeParticipants}
-            onRedial={handleRedialRequest}
+            onRedial={(p) =>
+              dialParticipant(p)
+                .then(() => showToast(`${p.display_name} redial initiated`))
+                .catch((e) => showToast("Redial failed"))
+            }
+            onRefresh={fetchParticipantsSnapshot}
             userRole={userRole}
           />
         </div>
